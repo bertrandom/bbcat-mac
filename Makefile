@@ -4,7 +4,7 @@ METADATA := $(APP)/Contents/Library/Spotlight/bbcat.mdimporter
 THUMBNAIL_BINARY := build/thumbnail/bbcatThumbnail
 RUST_LIB := RustBridge/target/release/libbbcat_bridge.a
 # Keep this pinned to the bbcat version in RustBridge/Cargo.lock.
-BBCAT_CLI_VERSION := 0.7.0
+BBCAT_CLI_VERSION := 0.7.1
 CLI_INSTALL_ROOT := build/bbcat-cli
 CLI_TARGET_DIR := build/bbcat-cli-target
 CLI_BINARY := $(CLI_INSTALL_ROOT)/bin/bbcat

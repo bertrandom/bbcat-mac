@@ -4,9 +4,9 @@ version = 4
 
 [[package]]
 name = "bbcat"
-version = "0.7.0"
+version = "0.7.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1bd2b6f000a6efc5fadd49a5523fb37a9e1603678b341882b883962f3f9917aa"
+checksum = "05148b02660e120b2a6bceae309a63204a236b757b32abb6c44473fc39f92d17"
 
 [[package]]
 name = "bbcat-bridge"
