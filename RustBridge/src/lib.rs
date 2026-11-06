@@ -3,6 +3,7 @@ use std::{
     ffi::{CStr, CString, c_char},
     path::Path,
     ptr,
+    sync::atomic::{AtomicBool, Ordering},
     time::Duration,
 };
 
@@ -21,6 +22,83 @@ const MAX_PNG_BUFFER_BYTES: usize = 100_000_000;
 pub struct BbcatDocument {
     document: bbcat::Document,
     info: bbcat::DocumentInfo,
+    /// For VGA 8x16 text, the artwork decoded with the other cell width: 9
+    /// pixels when the file decodes as 8 (no SAUCE or SAUCE asking for 8), and
+    /// 8 when its SAUCE asks for 9. `None` for everything else.
+    alternate: Option<bbcat::Document>,
+    /// The cell width the app asked for; it wins over whatever SAUCE says.
+    use_nine_pixel: AtomicBool,
+    /// The SAUCE TFlags byte, when the file has a SAUCE record.
+    sauce_flags: Option<u8>,
+}
+
+impl BbcatDocument {
+    fn decodes_as_nine_pixel(&self) -> bool {
+        self.info.glyph_dimensions.0 == 9
+    }
+
+    /// The document that rendering and export currently use.
+    fn active(&self) -> &bbcat::Document {
+        match &self.alternate {
+            Some(alternate)
+                if self.use_nine_pixel.load(Ordering::Relaxed) != self.decodes_as_nine_pixel() =>
+            {
+                alternate
+            }
+            _ => &self.document,
+        }
+    }
+}
+
+const SAUCE_RECORD: usize = 128;
+const SAUCE_FLAGS: usize = 105;
+
+fn sauce_flags(data: &[u8]) -> Option<u8> {
+    let start = data.len().checked_sub(SAUCE_RECORD)?;
+    data[start..]
+        .starts_with(b"SAUCE00")
+        .then(|| data[start + SAUCE_FLAGS])
+}
+
+/// SAUCE fonts that are not IBM VGA and so keep their native 8-pixel cells.
+fn uses_non_vga_font(info: &bbcat::DocumentInfo) -> bool {
+    info.sauce.as_ref().is_some_and(|sauce| {
+        let name = sauce.font_name.to_ascii_lowercase();
+        name.starts_with("amiga") || name.starts_with("empathy")
+    })
+}
+
+/// Returns `data` with a SAUCE record that asks for 8- or 9-pixel VGA letter
+/// spacing, patching an existing record's flags or appending a minimal one.
+/// With 9 pixels bbcat widens every cell, repeating the eighth column of the
+/// line-drawing characters as VGA hardware does.
+fn with_letter_spacing(data: &[u8], format: bbcat::Format, nine_pixel: bool) -> Vec<u8> {
+    const RECORD: usize = SAUCE_RECORD;
+    const FLAGS: usize = SAUCE_FLAGS;
+    let spacing = if nine_pixel { 0b100 } else { 0b010 };
+    let mut patched = data.to_vec();
+    if sauce_flags(data).is_some() {
+        let flags = &mut patched[data.len() - RECORD + FLAGS];
+        *flags = (*flags & !0b110) | spacing;
+        return patched;
+    }
+    // Without SAUCE, ANSI text ends at the first DOS EOF byte; binary formats
+    // such as TundraDraw use every byte.
+    let content_len = if format == bbcat::Format::AnsiText {
+        data.iter().position(|&byte| byte == 0x1a).unwrap_or(data.len())
+    } else {
+        data.len()
+    };
+    patched.truncate(content_len);
+    patched.push(0x1a);
+    let mut record = [0_u8; RECORD];
+    record[..7].copy_from_slice(b"SAUCE00");
+    record[90..94].copy_from_slice(&(content_len as u32).to_le_bytes());
+    record[94] = 1; // character data
+    record[95] = 1; // ANSi
+    record[FLAGS] = spacing;
+    patched.extend_from_slice(&record);
+    patched
 }
 
 #[repr(C)]
@@ -117,7 +195,33 @@ pub extern "C" fn bbcat_document_open(path: *const c_char) -> *mut BbcatDocument
         )
         .map_err(|error| error.to_string())?;
         let info = document.info();
-        Ok::<_, String>(Box::into_raw(Box::new(BbcatDocument { document, info })))
+        let (glyph_width, glyph_height) = info.glyph_dimensions;
+        let decodes_as_nine_pixel = glyph_width == 9;
+        let other_width = if decodes_as_nine_pixel { 8 } else { 9 };
+        let alternate = (matches!(info.format, bbcat::Format::AnsiText | bbcat::Format::TundraDraw)
+            && !info.raster
+            && matches!(glyph_width, 8 | 9)
+            && glyph_height == 16
+            && !uses_non_vga_font(&info))
+        .then(|| {
+            bbcat::decode_with_options(
+                &with_letter_spacing(&data, info.format, !decodes_as_nine_pixel),
+                bbcat::DecodeOptions {
+                    file_name: Some(path),
+                    width: None,
+                },
+            )
+            .ok()
+        })
+        .flatten()
+        .filter(|alternate| alternate.info().glyph_dimensions == (other_width, 16));
+        Ok::<_, String>(Box::into_raw(Box::new(BbcatDocument {
+            document,
+            info,
+            alternate,
+            use_nine_pixel: AtomicBool::new(decodes_as_nine_pixel),
+            sauce_flags: sauce_flags(&data),
+        })))
     })();
     match result {
         Ok(document) => document,
@@ -294,10 +398,11 @@ pub unsafe extern "C" fn bbcat_document_supports_scale(
     }
     // SAFETY: A non-null document pointer is owned by the caller for this call.
     let document = unsafe { &*document };
+    let active = document.active();
     i32::from(dimensions_support_scale(
-        document.info.pixel_dimensions,
+        active.screen.pixel_dimensions(),
         scale,
-        document.document.format == bbcat::Format::TundraDraw,
+        active.format == bbcat::Format::TundraDraw,
     ))
 }
 
@@ -327,6 +432,87 @@ fn dimensions_support_scale(
             .and_then(|row| row.checked_add(1))
             .and_then(|row| row.checked_mul(height))
             .is_some_and(|bytes| bytes <= MAX_PNG_BUFFER_BYTES)
+}
+
+#[unsafe(no_mangle)]
+/// Returns whether the artwork is VGA 8x16 text, so the 9px font and legacy
+/// (4:3 CRT) aspect options apply to it.
+///
+/// # Safety
+///
+/// `document` must be null or a live pointer returned by
+/// [`bbcat_document_open`].
+pub unsafe extern "C" fn bbcat_document_has_vga_text(document: *const BbcatDocument) -> i32 {
+    if document.is_null() {
+        return 0;
+    }
+    // SAFETY: A non-null document pointer is owned by the caller for this call.
+    i32::from(unsafe { (*document).alternate.is_some() })
+}
+
+#[unsafe(no_mangle)]
+/// Reports what the file's SAUCE record suggests for display. `letter_spacing`
+/// receives 8, 9 or 0 (not specified); `legacy_aspect` receives 1 (stretch to
+/// the 4:3 CRT pixel shape), 0 (square pixels) or -1 (not specified).
+///
+/// # Safety
+///
+/// `document` must be null or a live pointer returned by
+/// [`bbcat_document_open`]; the outputs must be writable `int32_t`s.
+pub unsafe extern "C" fn bbcat_document_sauce_display_hints(
+    document: *const BbcatDocument,
+    letter_spacing: *mut i32,
+    legacy_aspect: *mut i32,
+) {
+    if document.is_null() || letter_spacing.is_null() || legacy_aspect.is_null() {
+        return;
+    }
+    // SAFETY: Non-null pointers are owned by the caller for this call.
+    let flags = unsafe { (*document).sauce_flags };
+    let (spacing, aspect) = flags.map_or((0, -1), sauce_display_hints);
+    unsafe {
+        letter_spacing.write(spacing);
+        legacy_aspect.write(aspect);
+    }
+}
+
+fn sauce_display_hints(flags: u8) -> (i32, i32) {
+    let spacing = match (flags >> 1) & 0b11 {
+        1 => 8,
+        2 => 9,
+        _ => 0,
+    };
+    let aspect = match (flags >> 3) & 0b11 {
+        1 => 1,
+        2 => 0,
+        _ => -1,
+    };
+    (spacing, aspect)
+}
+
+#[unsafe(no_mangle)]
+/// Switches rendering and export between 8- and 9-pixel character cells.
+/// Returns whether 9-pixel cells are now in use.
+///
+/// # Safety
+///
+/// `document` must be null or a live pointer returned by
+/// [`bbcat_document_open`].
+pub unsafe extern "C" fn bbcat_document_set_nine_pixel_font(
+    document: *const BbcatDocument,
+    enabled: i32,
+) -> i32 {
+    if document.is_null() {
+        return 0;
+    }
+    // SAFETY: A non-null document pointer is owned by the caller for this call.
+    let document = unsafe { &*document };
+    document.use_nine_pixel.store(enabled != 0, Ordering::Relaxed);
+    i32::from(if document.alternate.is_some() {
+        enabled != 0
+    } else {
+        document.decodes_as_nine_pixel()
+    })
 }
 
 #[unsafe(no_mangle)]
@@ -388,7 +574,7 @@ pub unsafe extern "C" fn bbcat_document_render_frame(
         return 0;
     }
     // SAFETY: Both non-null pointers remain valid for this call.
-    let document = unsafe { &(*document).document };
+    let document = unsafe { (*document).active() };
     let result =
         if let Some(animation) = document.animation.as_ref().filter(|a| !a.frames.is_empty()) {
             animation
@@ -468,7 +654,7 @@ pub unsafe extern "C" fn bbcat_document_encode_png(
         return 0;
     }
     // SAFETY: Both non-null pointers remain valid for this call.
-    let document = unsafe { &(*document).document };
+    let document = unsafe { (*document).active() };
     return_encoded_bytes(
         document
             .encode_png(scale)
@@ -495,7 +681,7 @@ pub unsafe extern "C" fn bbcat_document_encode_gif(
         return 0;
     }
     // SAFETY: Both non-null pointers remain valid for this call.
-    let document = unsafe { &(*document).document };
+    let document = unsafe { (*document).active() };
     return_encoded_bytes(
         document
             .encode_gif(bbcat::DEFAULT_ANIMATION_BAUD, scale)
@@ -633,6 +819,34 @@ mod tests {
         NATIVE_ANIMATION_BYTES_PER_SECOND, dimensions_support_scale, format_sauce_date,
         frame_duration,
     };
+
+    #[test]
+    fn letter_spacing_overrides_the_file() {
+        let decode = |data: &[u8]| {
+            bbcat::decode_with_options(
+                data,
+                bbcat::DecodeOptions { file_name: Some(Path::new("x.ans")), width: None },
+            )
+            .unwrap()
+        };
+        for data in [&b"\xc4\xc4 hi"[..], &b"\xc4\xc4 hi\x1ajunk"[..]] {
+            let nine = super::with_letter_spacing(data, bbcat::Format::AnsiText, true);
+            assert_eq!(decode(&nine).info().glyph_dimensions, (9, 16));
+            assert_eq!(decode(&nine).screen.width, 5);
+            // A file whose SAUCE asks for 9 pixels can still be shown with 8.
+            let eight = super::with_letter_spacing(&nine, bbcat::Format::AnsiText, false);
+            assert_eq!(decode(&eight).info().glyph_dimensions, (8, 16));
+            assert_eq!(super::sauce_flags(&eight), Some(0b010));
+        }
+    }
+
+    #[test]
+    fn reads_sauce_display_hints() {
+        assert_eq!(super::sauce_display_hints(0x0a), (8, 1));
+        assert_eq!(super::sauce_display_hints(0x0c), (9, 1));
+        assert_eq!(super::sauce_display_hints(0x14), (9, 0));
+        assert_eq!(super::sauce_display_hints(0x01), (0, -1));
+    }
 
     #[test]
     fn formats_sauce_dates() {

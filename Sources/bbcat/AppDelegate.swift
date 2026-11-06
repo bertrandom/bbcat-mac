@@ -63,6 +63,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         let info = viewMenu.addItem(withTitle: "Show Info", action: Selector(("toggleInspector")), keyEquivalent: "i")
         info.keyEquivalentModifierMask = [.command, .option]
         info.target = viewer
+        let ninePixel = viewMenu.addItem(withTitle: "Use 9px Font", action: #selector(ViewerController.toggleNinePixelFont(_:)), keyEquivalent: "")
+        ninePixel.target = viewer
+        let aspect = viewMenu.addItem(withTitle: "Emulate Legacy Aspect", action: #selector(ViewerController.toggleLegacyAspect(_:)), keyEquivalent: "")
+        aspect.target = viewer
+        viewMenu.addItem(.separator())
+        let sidebar = viewMenu.addItem(withTitle: "Hide Sidebar", action: #selector(ViewerController.toggleSidebar(_:)), keyEquivalent: "s")
+        sidebar.keyEquivalentModifierMask = [.command, .control]
+        sidebar.target = viewer
         NSApp.mainMenu = main
     }
 

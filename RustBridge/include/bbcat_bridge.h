@@ -46,6 +46,13 @@ size_t bbcat_document_frame_count(const BbcatDocument *document);
 int32_t bbcat_document_is_animated(const BbcatDocument *document);
 int32_t bbcat_document_copy_info(const BbcatDocument *document, BbcatDocumentInfo *info);
 char *bbcat_document_copy_metadata_string(const BbcatDocument *document, int32_t field);
+int32_t bbcat_document_has_vga_text(const BbcatDocument *document);
+void bbcat_document_sauce_display_hints(
+    const BbcatDocument *document,
+    int32_t *letter_spacing,
+    int32_t *legacy_aspect
+);
+int32_t bbcat_document_set_nine_pixel_font(const BbcatDocument *document, int32_t enabled);
 int32_t bbcat_document_supports_scale(const BbcatDocument *document, size_t scale);
 char *bbcat_document_display_title(const BbcatDocument *document, const char *fallback);
 int32_t bbcat_document_render_frame(

@@ -6,6 +6,9 @@ final class ViewerController: NSWindowController, NSWindowDelegate {
     private let artworkView = ArtworkView(frame: .zero)
     private let scrollView = NSScrollView(frame: .zero)
     private let inspectorView = InfoInspectorView(frame: .zero)
+    private let sidebar = FileSidebarController()
+    private let splitViewController = NSSplitViewController()
+    private var sidebarItem: NSSplitViewItem!
     private let infoPopover = NSPopover()
     private weak var infoButton: NSButton?
     private weak var fitButton: NSButton?
@@ -13,6 +16,18 @@ final class ViewerController: NSWindowController, NSWindowDelegate {
     private var scale = 1
     private var supportsTwoX = false
     private var fitsToScreenVertically = false
+    private static let ninePixelFontKey = "UseNinePixelFont"
+    private static let legacyAspectKey = "EmulateLegacyAspect"
+    // The View options as currently checked; these alone decide how VGA text is
+    // drawn. Opening a file resets them to what its SAUCE asks for, or else to
+    // the user's last choice (saved in defaults; both default to on).
+    private var ninePixelFont = ViewerController.savedOption(ViewerController.ninePixelFontKey)
+    private var legacyAspect = ViewerController.savedOption(ViewerController.legacyAspectKey)
+
+    private static func savedOption(_ key: String) -> Bool {
+        UserDefaults.standard.object(forKey: key) as? Bool ?? true
+    }
+    private weak var aspectButton: NSButton?
     private var frameIndex = 0
     private var playbackGeneration = 0
 
@@ -38,6 +53,7 @@ final class ViewerController: NSWindowController, NSWindowDelegate {
 
     private func configureContent() {
         scrollView.translatesAutoresizingMaskIntoConstraints = false
+        scrollView.postsFrameChangedNotifications = true
         scrollView.drawsBackground = true
         scrollView.backgroundColor = .black
         scrollView.borderType = .noBorder
@@ -46,7 +62,54 @@ final class ViewerController: NSWindowController, NSWindowDelegate {
         scrollView.hasVerticalScroller = false
         artworkView.autoresizingMask = [.width, .height]
         scrollView.documentView = artworkView
-        window?.contentView = scrollView
+
+        let artworkContainer = NSView()
+        artworkContainer.addSubview(scrollView)
+        NSLayoutConstraint.activate([
+            scrollView.leadingAnchor.constraint(equalTo: artworkContainer.leadingAnchor),
+            scrollView.trailingAnchor.constraint(equalTo: artworkContainer.trailingAnchor),
+            scrollView.topAnchor.constraint(equalTo: artworkContainer.topAnchor),
+            scrollView.bottomAnchor.constraint(equalTo: artworkContainer.bottomAnchor),
+        ])
+        let artworkController = NSViewController()
+        artworkController.view = artworkContainer
+
+        sidebar.onSelect = { [weak self] url in self?.open(url, resizeWindow: false) }
+        sidebarItem = NSSplitViewItem(sidebarWithViewController: sidebar)
+        sidebarItem.minimumThickness = 160
+        sidebarItem.maximumThickness = 360
+        sidebarItem.canCollapse = true
+        let contentItem = NSSplitViewItem(viewController: artworkController)
+        contentItem.minimumThickness = 240
+        splitViewController.addSplitViewItem(sidebarItem)
+        splitViewController.addSplitViewItem(contentItem)
+        splitViewController.view.frame = window?.contentView?.bounds ?? .zero
+        sidebar.view.frame.size.width = 220
+        window?.contentViewController = splitViewController
+
+        // Re-fit the artwork whenever its pane changes size: window resizes,
+        // dragging the divider, or showing/hiding the sidebar.
+        NotificationCenter.default.addObserver(
+            self, selector: #selector(artworkPaneDidResize),
+            name: NSView.frameDidChangeNotification, object: scrollView
+        )
+    }
+
+    @objc private func artworkPaneDidResize() {
+        guard let size = artworkView.image?.size else { return }
+        configureLayout(for: size, resizeWindow: false)
+    }
+
+    @objc func toggleSidebar(_ sender: Any?) {
+        sidebarItem.animator().isCollapsed.toggle()
+    }
+
+    private var sidebarWidth: CGFloat {
+        sidebarItem.isCollapsed ? 0 : sidebar.view.frame.width + splitViewController.splitView.dividerThickness
+    }
+
+    func windowDidBecomeKey(_ notification: Notification) {
+        sidebar.refresh()
     }
 
     private func configureInfoPopover() {
@@ -76,20 +139,30 @@ final class ViewerController: NSWindowController, NSWindowDelegate {
         artworkView.setAccessibilityLabel("Open an artwork to view it")
     }
 
-    func open(_ url: URL) {
+    func open(_ url: URL, resizeWindow: Bool = true) {
         playbackGeneration &+= 1
         do {
             let loaded = try bbcatDocument(url: url)
+            if loaded.hasVGAText {
+                ninePixelFont = loaded.sauceSuggestsNinePixelFont ?? Self.savedOption(Self.ninePixelFontKey)
+                legacyAspect = loaded.sauceSuggestsLegacyAspect ?? Self.savedOption(Self.legacyAspectKey)
+            }
+            loaded.setNinePixelFont(ninePixelFont)
+            loaded.emulatesLegacyAspect = legacyAspect
             artworkDocument = loaded
             updateScaleControl(for: loaded)
             artworkView.maximumFitScale = nil
             frameIndex = 0
             window?.title = loaded.displayTitle
-            try displayFrame(generation: playbackGeneration, resizeWindow: true)
+            try displayFrame(generation: playbackGeneration, resizeWindow: resizeWindow)
+            scrollView.contentView.scroll(to: .zero)
+            scrollView.reflectScrolledClipView(scrollView.contentView)
             window?.representedURL = url
             inspectorView.show(document: loaded)
+            sidebar.show(fileAt: url)
             updateToolbarItems()
         } catch {
+            sidebar.revertSelection(to: artworkDocument?.sourceURL)
             present(error)
         }
     }
@@ -100,7 +173,7 @@ final class ViewerController: NSWindowController, NSWindowDelegate {
         panel.prompt = "Open"
         panel.allowsMultipleSelection = false
         panel.canChooseDirectories = false
-        panel.allowedContentTypes = ["ans", "asc", "diz", "nfo", "ddw", "adf", "rip", "tnd", "xb", "xbin"]
+        panel.allowedContentTypes = FileSidebarController.supportedExtensions.sorted()
             .compactMap { UTType(filenameExtension: $0) }
         panel.beginSheetModal(for: window!) { [weak self] response in
             if response == .OK, let url = panel.url { self?.open(url) }
@@ -121,6 +194,34 @@ final class ViewerController: NSWindowController, NSWindowDelegate {
             sender.selectedSegment = previousScale - 1
             present(error)
         }
+    }
+
+    @objc func toggleNinePixelFont(_ sender: Any?) {
+        ninePixelFont.toggle()
+        UserDefaults.standard.set(ninePixelFont, forKey: Self.ninePixelFontKey)
+        artworkDocument?.setNinePixelFont(ninePixelFont)
+        rerenderAfterDisplayOptionChange()
+    }
+
+    @objc func toggleLegacyAspect(_ sender: Any?) {
+        legacyAspect.toggle()
+        UserDefaults.standard.set(legacyAspect, forKey: Self.legacyAspectKey)
+        artworkDocument?.emulatesLegacyAspect = legacyAspect
+        rerenderAfterDisplayOptionChange()
+    }
+
+    private func rerenderAfterDisplayOptionChange() {
+        if let artworkDocument {
+            updateScaleControl(for: artworkDocument)
+            playbackGeneration &+= 1
+            frameIndex = 0
+            do {
+                try displayFrame(generation: playbackGeneration, resizeWindow: true)
+            } catch {
+                present(error, message: "Could not render artwork")
+            }
+        }
+        updateToolbarItems()
     }
 
     @objc private func toggleFitToScreen(_ sender: NSButton) {
@@ -217,7 +318,8 @@ final class ViewerController: NSWindowController, NSWindowDelegate {
 
     private func configureLayout(for imageSize: NSSize, resizeWindow: Bool) {
         let visible = window?.screen?.visibleFrame ?? NSScreen.main?.visibleFrame ?? NSRect(x: 0, y: 0, width: 1200, height: 800)
-        let maxWidth = floor(visible.width * 0.9)
+        let chromeWidth = sidebarWidth
+        let maxWidth = floor(visible.width * 0.9) - chromeWidth
         let maxHeight = floor(visible.height * 0.9)
         let needsFitWidth = imageSize.width > maxWidth || imageSize.height > maxHeight
 
@@ -236,7 +338,8 @@ final class ViewerController: NSWindowController, NSWindowDelegate {
                     height: min(max(imageSize.height, 200), maxHeight)
                 )
             }
-            window?.setContentSize(contentSize)
+            window?.setContentSize(NSSize(width: contentSize.width + chromeWidth, height: contentSize.height))
+            window?.contentView?.layoutSubtreeIfNeeded()
             window?.center()
         }
 
@@ -282,11 +385,6 @@ final class ViewerController: NSWindowController, NSWindowDelegate {
         )
     }
 
-    func windowDidResize(_ notification: Notification) {
-        guard let size = artworkView.image?.size else { return }
-        configureLayout(for: size, resizeWindow: false)
-    }
-
     private func updateToolbarItems() {
         guard let toolbar = window?.toolbar else { return }
         for item in toolbar.items {
@@ -299,6 +397,13 @@ final class ViewerController: NSWindowController, NSWindowDelegate {
                 item.toolTip = infoPopover.isShown ? "Hide artwork information" : "Show artwork information"
                 infoButton?.state = infoPopover.isShown ? .on : .off
                 infoButton?.toolTip = item.toolTip
+            case Self.aspectIdentifier:
+                item.isEnabled = artworkDocument?.hasVGAText ?? true
+                aspectButton?.state = legacyAspect ? .on : .off
+                aspectButton?.toolTip = legacyAspect
+                    ? "Showing legacy aspect (4:3 CRT pixels); click for square pixels"
+                    : "Emulate legacy aspect (4:3 CRT pixels)"
+                item.toolTip = aspectButton?.toolTip
             case Self.fitIdentifier:
                 item.isEnabled = artworkDocument != nil
                 fitButton?.state = fitsToScreenVertically ? .on : .off
@@ -325,19 +430,31 @@ extension ViewerController: NSToolbarDelegate {
     private static let scaleIdentifier = NSToolbarItem.Identifier("Scale")
     private static let infoIdentifier = NSToolbarItem.Identifier("Info")
     private static let fitIdentifier = NSToolbarItem.Identifier("FitScreen")
+    private static let aspectIdentifier = NSToolbarItem.Identifier("LegacyAspect")
 
     func toolbarAllowedItemIdentifiers(_ toolbar: NSToolbar) -> [NSToolbarItem.Identifier] {
-        [Self.openIdentifier, Self.exportIdentifier, Self.infoIdentifier, Self.fitIdentifier,
-         .flexibleSpace, Self.scaleIdentifier]
+        [.toggleSidebar, Self.openIdentifier, Self.exportIdentifier, Self.infoIdentifier, Self.fitIdentifier,
+         Self.aspectIdentifier, .flexibleSpace, Self.scaleIdentifier]
     }
 
     func toolbarDefaultItemIdentifiers(_ toolbar: NSToolbar) -> [NSToolbarItem.Identifier] {
-        [Self.openIdentifier, Self.exportIdentifier, Self.infoIdentifier, Self.fitIdentifier,
-         .flexibleSpace, Self.scaleIdentifier]
+        [.toggleSidebar, Self.openIdentifier, Self.exportIdentifier, Self.infoIdentifier, Self.fitIdentifier,
+         Self.aspectIdentifier, .flexibleSpace, Self.scaleIdentifier]
     }
 
     func toolbar(_ toolbar: NSToolbar, itemForItemIdentifier identifier: NSToolbarItem.Identifier,
                  willBeInsertedIntoToolbar flag: Bool) -> NSToolbarItem? {
+        if identifier == .toggleSidebar {
+            let item = NSToolbarItem(itemIdentifier: identifier)
+            item.label = "Sidebar"
+            item.toolTip = "Show or hide the file sidebar"
+            item.image = NSImage(systemSymbolName: "sidebar.left", accessibilityDescription: "Toggle sidebar")
+            item.target = self
+            item.action = #selector(toggleSidebar(_:))
+            item.isBordered = true
+            item.visibilityPriority = .high
+            return item
+        }
         let item = NSToolbarItem(itemIdentifier: identifier)
         if identifier == Self.openIdentifier {
             item.label = "Open"
@@ -381,6 +498,23 @@ extension ViewerController: NSToolbarDelegate {
             item.view = button
             item.isEnabled = artworkDocument != nil
             item.visibilityPriority = .low
+        } else if identifier == Self.aspectIdentifier {
+            let button = NSButton(
+                image: NSImage(systemSymbolName: "tv", accessibilityDescription: "Emulate legacy aspect")!,
+                target: self,
+                action: #selector(toggleLegacyAspect(_:))
+            )
+            button.bezelStyle = .toolbar
+            button.imagePosition = .imageOnly
+            button.setButtonType(.toggle)
+            button.state = legacyAspect ? .on : .off
+            button.setAccessibilityLabel("Emulate legacy aspect")
+            button.widthAnchor.constraint(equalToConstant: 32).isActive = true
+            button.heightAnchor.constraint(equalToConstant: 28).isActive = true
+            aspectButton = button
+            item.label = "Legacy Aspect"
+            item.view = button
+            item.visibilityPriority = .low
         } else if identifier == Self.infoIdentifier {
             let button = NSButton(
                 image: NSImage(systemSymbolName: "info.circle", accessibilityDescription: "Artwork information")!,
@@ -412,6 +546,17 @@ extension ViewerController: NSMenuItemValidation {
         if menuItem.action == #selector(toggleInspector) {
             menuItem.title = infoPopover.isShown ? "Hide Info" : "Show Info"
             return artworkDocument != nil
+        }
+        if menuItem.action == #selector(toggleNinePixelFont(_:)) {
+            menuItem.state = ninePixelFont ? .on : .off
+            return artworkDocument?.hasVGAText ?? true
+        }
+        if menuItem.action == #selector(toggleLegacyAspect(_:)) {
+            menuItem.state = legacyAspect ? .on : .off
+            return artworkDocument?.hasVGAText ?? true
+        }
+        if menuItem.action == #selector(toggleSidebar(_:)) {
+            menuItem.title = sidebarItem.isCollapsed ? "Show Sidebar" : "Hide Sidebar"
         }
         return true
     }
